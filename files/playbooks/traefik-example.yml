@@ -1,0 +1,29 @@
+api:
+  dashboard: true # Enables the Traefik web UI dashboard for monitoring traffic and routing
+  insecure: false # Forces secure access to the dashboard (requires basic auth middleware in docker-compose)
+
+entryPoints:
+  web:
+    address: ':80' # Listens on standard HTTP port
+    http:
+      redirections:
+        entryPoint:
+          to: websecure # Automatically redirects all incoming HTTP traffic...
+          scheme: https # ...to HTTPS
+          permanent: true # Uses a 301 Permanent Redirect status code
+  websecure:
+    address: ':443' # Listens on standard HTTPS port for secure traffic
+
+providers:
+  docker:
+    endpoint: 'unix:///var/run/docker.sock' # Connects to the local Docker daemon socket
+    exposedByDefault: false # Security constraint: only routes containers explicitly labeled for Traefik
+    network: traefik-net # The dedicated Docker network Traefik uses to communicate with other containers
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: YOUR_MAIL # Email used for Let's Encrypt registration and expiration notices
+      storage: /acme.json # File inside the container where SSL certificates will be saved
+      httpChallenge:
+        entryPoint: web # Verifies domain ownership via port 80 before issuing SSL certificates

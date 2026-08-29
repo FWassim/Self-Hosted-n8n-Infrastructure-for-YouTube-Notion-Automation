@@ -1,0 +1,57 @@
+---
+- name: Deploy n8n and Traefik stack
+  hosts: vps
+  become: yes
+  vars:
+    app_user: "n8n"
+    app_dir: "/home/{{ app_user }}/n8n-youtube-pipeline"
+
+  tasks:
+    - name: Ensure project directories exist # Scaffolds the entire directory structure for the project
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+      loop:
+        - "{{ app_dir }}"
+        - "{{ app_dir }}/traefik"
+        - "{{ app_dir }}/n8n-data"
+        - "{{ app_dir }}/backups"
+        - "{{ app_dir }}/scripts"
+        - "{{ app_dir }}/logs"
+
+    - name: Create empty acme.json for Traefik with strict permissions # Prepares the SSL storage file
+      file:
+        path: "{{ app_dir }}/traefik/acme.json"
+        state: touch 
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600' # CRITICAL: Read/write only for the owner. Traefik will reject the file otherwise.
+
+    - name: Copy traefik static configuration
+      copy:
+        src: traefik.yml
+        dest: "{{ app_dir }}/traefik/traefik.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+
+    - name: Copy docker-compose and .env files 
+      copy:
+        src: "../{{ item }}"
+        dest: "{{ app_dir }}/{{ item }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600' 
+      loop:
+        - docker-compose.yml
+        - .env
+        - .htpasswd
+
+    - name: Start Docker Compose stack 
+      command: docker compose up -d
+      args:
+        chdir: "{{ app_dir }}" # Changes directory to the project folder before executing the command
+      become_user: "{{ app_user }}" 

@@ -1,0 +1,33 @@
+# ── Secrets & credentials ───────────────────────────────
+.env
+.htpasswd
+
+# ── Real inventories (contain your actual VPS IP / user) ──
+files/inventory-initial-config.ini
+files/inventory-vps-config.ini
+
+# ── Real Traefik config (contains your actual domain names) ──
+files/playbooks/traefik.yml
+
+# ── Let's Encrypt certificates & ACME state ────────────
+acme.json
+traefik/acme.json
+**/acme.json
+
+# ── n8n runtime data & workflows ────────────────────────
+n8n_data/
+*.n8n
+Youtube_deployment.json
+*_deployment.json
+
+# ── Video storage / backups (scaffolded by deploy-infra.yml) ──
+videos/
+backups/
+logs/
+
+# ── OS / editor noise ───────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

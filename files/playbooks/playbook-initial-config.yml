@@ -1,0 +1,126 @@
+---
+- name: VPS Security config
+  hosts: vps
+  become: yes
+  vars:
+    app_user: "n8n"
+    custom_ssh_port: "2222"
+    # CRITICAL: Ensure this path is absolutely correct to avoid Fail2ban lockouts
+    main_pub_key: "{{ lookup('file', 'PATH_TO_YOUR_PUBLIC_KEY') }}"
+    # Add your local public IP here to prevent Fail2ban from locking you out
+    my_local_ip: "YOUR_LOCAL_IP_ADDRESS" 
+  
+  tasks:
+    - name: Updating packets
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Installing packets
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - ufw
+          - nano
+          - htop
+          - fail2ban
+        state: present
+
+    - name: Creating app user # Create a non-root user with sudo privileges for daily operations
+      user:
+        name: "{{ app_user }}"
+        shell: /bin/bash
+        groups: sudo
+        append: yes
+        create_home: yes
+        password: "{{ 'USER_PASSWORD' | password_hash('sha512', 'my_secret_salt') }}"
+
+    - name: Deploy ssh keys for the app user # Push your public SSH key to the new user's authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ app_user }}"
+        state: present
+        key: "{{ main_pub_key }}"
+
+    - name: Disable ssh.socket (Prevents port 22 override on Ubuntu 22.04+)
+      ansible.builtin.systemd:
+        name: ssh.socket
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Ensure standard ssh service is enabled
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: yes
+
+    - name: Changing SSH port # Modify sshd_config to listen on the new custom port
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Port\s+'
+        line: "Port {{ custom_ssh_port }}"
+      notify: Restart SSH
+
+    - name: Disabling passwd authentication # Force SSH key usage by disabling password logins
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication\s+'
+        line: "PasswordAuthentication no"
+      notify: Restart SSH
+
+    - name: SSH - Removing root connect directly # Prevent root from logging in with a password
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin\s+'
+        line: "PermitRootLogin prohibit-password"
+      notify: Restart SSH
+
+    - name: Force SSH restart immediately to avoid UFW lockout # Apply SSH changes before UFW blocks port 22
+      meta: flush_handlers
+
+    - name: UFW Config # Open strictly necessary ports (Custom SSH, HTTP, HTTPS)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: tcp
+        comment: "{{ item.comment }}"
+      loop:
+        - { port: "{{ custom_ssh_port }}", comment: 'SSH custom port' }
+        - { port: '80', comment: 'HTTP Traefik challenge' }
+        - { port: '443', comment: 'HTTPS Traefik' }
+
+    - name: Enable UFW # Activate the firewall and block all other incoming traffic by default
+      community.general.ufw:
+        state: enabled
+        default: deny
+        direction: incoming
+
+    - name: Config Fail2ban # Prevent brute-force attacks on the new SSH port, whitelisting your IP
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          ignoreip = 127.0.0.1/8 ::1 {{ my_local_ip }}
+          bantime = 3600
+          findtime = 600
+          maxretry = 5
+          backend = systemd
+          
+          [sshd]
+          enabled = true
+          port = {{ custom_ssh_port }}
+          logpath = %(sshd_log)s
+          maxretry = 3
+      notify: Restart Fail2ban
+
+  handlers:
+    - name: Restart SSH
+      service:
+        name: ssh
+        state: reloaded
+
+    - name: Restart Fail2ban
+      service:
+        name: fail2ban
+        state: restarted

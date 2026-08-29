@@ -1,0 +1,127 @@
+# ─── Internal Docker network ────────────────────────────────
+networks:
+  traefik-net:
+    # Creates a dedicated, isolated Docker network for this stack. 
+    # external: false means Docker Compose will create it automatically if it doesn't exist.
+    external: false 
+
+# ─── Named Volumes ───────────────────────────────────────
+volumes:
+  postgres_data: # Persistent storage for the PostgreSQL database (prevents data loss on container restart)
+  n8n_data:      # Persistent storage for n8n workflows, credentials, and settings
+
+services:
+  # ════════ Traefik — Reverse Proxy + SSL ════════
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - '80:80'   
+      - '443:443' 
+    environment:                           
+      - DOCKER_API_VERSION=1.41 # Ensures Traefik can communicate with the host's Docker daemon version
+    volumes:
+      - ./traefik/traefik.yml:/traefik.yml:ro 
+      # Mounts the Let's Encrypt certificates storage (MUST have 600 permissions on the host)
+      - ./traefik/acme.json:/acme.json
+      # Gives Traefik access to Docker events to dynamically discover new containers
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./logs:/logs # Mounts a local folder to store Traefik access/error logs
+      - ./.htpasswd:/.htpasswd:ro # Mounts the credentials file used to secure the Traefik dashboard
+    networks:
+      - traefik-net
+    labels:
+      - 'traefik.enable=true' # Tells Traefik to route traffic for this specific container
+      # Defines the routing rule: matches the domain (e.g., traefik.yourdomain.com) AND the specific paths (/api or /dashboard)
+      - 'traefik.http.routers.dashboard.rule=Host(`traefik.${DOMAIN}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`))'
+      - 'traefik.http.routers.dashboard.entrypoints=websecure' # Forces the dashboard to use HTTPS
+      - 'traefik.http.routers.dashboard.tls.certresolver=letsencrypt' # Tells Let's Encrypt to generate an SSL cert for the dashboard
+      - 'traefik.http.routers.dashboard.service=api@internal' # Routes traffic to Traefik's internal API/Dashboard service
+      - 'traefik.http.routers.dashboard.middlewares=auth' # Applies the 'auth' middleware defined below
+      - 'traefik.http.middlewares.auth.basicauth.usersFile=/.htpasswd' # Specifies the file containing dashboard passwords
+
+  # ════════ PostgreSQL ( N8N DB ) ════════
+  postgres:
+    image: postgres:15-alpine 
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      # These variables are ONLY read on the very first boot to initialize the database cluster
+      - POSTGRES_DB=${POSTGRES_DB}             # The name of the database created for n8n
+      - POSTGRES_USER=${POSTGRES_USER}         # The administrator username
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD} # The administrator password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Maps the named volume to the container's Postgres data directory
+    networks:
+      - traefik-net
+    healthcheck:
+      # Runs a native Postgres command to check if the database is ready to accept connections
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 10s
+      timeout: 5s   
+      retries: 5    
+
+  # ════════ N8N ════════
+  n8n:
+    image: n8nio/n8n
+    container_name: n8n
+    restart: unless-stopped
+    environment:
+      # --- General & Routing ---
+      - N8N_PORT=5678                          
+      - N8N_PROTOCOL=${N8N_PROTOCOL}           # Should be 'https' since Traefik sits in front and handles SSL
+      - WEBHOOK_URL=${WEBHOOK_URL}             # CRITICAL: The external URL of your n8n instance (needed for YouTube/Notion OAuth callbacks)
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}   # Ensures cron nodes and API timestamps match your local time
+      - N8N_SECURE_COOKIE=false                # False because the connection between Traefik and n8n is internal HTTP
+
+      # --- Performance & Stability ---
+      - EXECUTIONS_TIMEOUT=${EXECUTIONS_TIMEOUT}         # Default timeout for workflows
+      - EXECUTIONS_TIMEOUT_MAX=${EXECUTIONS_TIMEOUT_MAX} # Absolute max time a workflow can run
+      
+      # --- Security (Basic Auth) ---
+      # Temporarily secures the n8n web interface before native user management is configured
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE} 
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+
+      # --- Database Connection ---
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=${POSTGRES_HOST}    # Uses the Docker service name ('postgres') as the hostname
+      - DB_POSTGRESDB_PORT=${POSTGRES_PORT}    # Standard Postgres port (5432)
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+
+      # --- Storage Optimization (Crucial for VPS constraints) ---
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=none   # Prevents database bloat by discarding data from successful runs
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all      # Keeps error logs to debug failed Notion or YouTube API calls
+      - EXECUTIONS_DATA_PRUNE=true             # Enables the automatic cleanup script
+      - EXECUTIONS_DATA_MAX_AGE=24             # Deletes error logs older than 24 hours
+      # Forces n8n to write large files to the disk volume instead of the Postgres database
+      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem 
+      - NODES_EXCLUDE="[]" # Ensures you have all the nodes (if you don't add it "Execute command" node won't appear)
+    volumes:
+      - n8n_data:/home/node/.n8n               # Persists n8n configurations and workflows
+    networks:
+      - traefik-net
+    depends_on:
+      postgres:
+        # Forces Docker to wait until the Postgres container passes its 'healthcheck' before starting n8n
+        condition: service_healthy 
+    labels:
+      - 'traefik.enable=true' # Enables Traefik routing for n8n
+      - 'traefik.http.routers.n8n.rule=Host(`n8n.${DOMAIN}`)' # Routes traffic matching n8n.yourdomain.com
+      - 'traefik.http.routers.n8n.entrypoints=websecure'
+      - 'traefik.http.routers.n8n.tls.certresolver=letsencrypt'
+      - 'traefik.http.services.n8n.loadbalancer.server.port=5678' # Tells Traefik which internal port n8n is using
+      
+      # --- Security Headers ---
+      # Enforces HSTS (HTTP Strict Transport Security) for 1 year (31,536,000 seconds)
+      - 'traefik.http.middlewares.n8n-headers.headers.stsSeconds=31536000'
+      - 'traefik.http.middlewares.n8n-headers.headers.forceSTSHeader=true'
+    deploy:
+      resources:
+        limits:
+          # Hard limit to prevent n8n memory leaks from crashing the host OS
+          memory: 1500M
